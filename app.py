@@ -546,6 +546,6 @@ class ServerHandler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    print(f"Serving at http://127.0.0.1:{PORT}")
-    with http.server.HTTPServer(("127.0.0.1", PORT), ServerHandler) as httpd:
+    print(f"Serving at http://0.0.0.0:{PORT}")
+    with http.server.HTTPServer(("0.0.0.0", PORT), ServerHandler) as httpd:
         httpd.serve_forever()
